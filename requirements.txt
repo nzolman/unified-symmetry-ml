@@ -1,0 +1,13 @@
+jax
+jaxopt
+sympy2jax
+sympy
+numpy
+pandas
+scipy
+cvxpy
+matplotlib
+seaborn
+PyYAML
+tqdm
+pysindy<2.0
