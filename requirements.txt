@@ -11,3 +11,4 @@ seaborn
 PyYAML
 tqdm
 pysindy<2.0
+diffrax
