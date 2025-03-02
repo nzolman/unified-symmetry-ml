@@ -1,9 +1,9 @@
 import pysindy as ps
 import numpy
 import jax.numpy as jnp
-from jax import random, jit, vmap
+from jax import random, jit, vmap, jacfwd
 
-from .symbolic_utils import symb_jac_from_feat, get_jax_from_symb
+from .symbolic_utils import symb_jac_from_feat, get_jax_from_symb, get_jax_fnlib_from_symb
 
 def L_out_X(lie_gens_out, lie_out_jac_X, fn_lib_X):
     '''
@@ -101,7 +101,8 @@ class BaseSymmLayer:
                  lie_in_library=None, 
                  lie_out_library=None, 
                  lie_in_generators=None, 
-                 lie_out_generators= None):
+                 lie_out_generators= None,
+                 jac_from_symb = False):
         '''
         dF/dx(x) @ phi_0(xi)(x) - d\phi_1(xi)/dx (x) @ F(x)
         W_fn @ dfn_lib(x) @ W_0 @ lie_lib(x) - W_1 @ dlie_lib(x) @ W_fn @ fn_lib(x)
@@ -142,9 +143,11 @@ class BaseSymmLayer:
         
         
         # initialize functions
-        self._make_fn_symbols()
-        self._make_lie_symbols()
-        self._make_jax_fn()
+        self._make_fn_symbols(jac_from_symb=jac_from_symb)
+        
+
+        self._make_lie_symbols(jac_from_symb=jac_from_symb)
+        self._make_jax_fn(jac_from_symb=jac_from_symb)
         self._make_jax_lie()
         
         self.W_fn = jnp.zeros((self.n_dim_out, self.n_fn_lib))
@@ -161,18 +164,24 @@ class BaseSymmLayer:
         '''Set Lie generator coefficients for the co-domain'''
         self.lie_out_generators = lie_out_generators
     
-    def _make_fn_symbols(self):
+    def _make_fn_symbols(self, jac_from_symb=False):
         # TO-DO: GET RID OF MANDATORY SYMBOLIC JACOBIAN—JUST USE AUTODIFF!
         '''Create SymPy symbols for the function library'''
         self.fn_library.fit(jnp.zeros(self.n_dim_in))
         
         self.fn_feature_names = self.fn_library.get_feature_names()
         self.n_fn_lib = len(self.fn_feature_names)
-        self.symb_fn_lib, self.symb_fn_jac = symb_jac_from_feat(feature_names=self.fn_feature_names, 
-                                                   n_state=self.n_dim_in)
+        
+
+        self.symb_fn_lib, self.symb_fn_jac = symb_jac_from_feat(
+                                                feature_names=self.fn_feature_names, 
+                                                n_state=self.n_dim_in,
+                                                return_jac = jac_from_symb
+                                                )
+        
         return self.symb_fn_lib, self.symb_fn_jac
     
-    def _make_lie_symbols(self):
+    def _make_lie_symbols(self, jac_from_symb = False):
         '''Create SymPy symbols for the Lie library'''
         self.lie_in_library.fit(jnp.zeros(self.n_dim_in))
         self.lie_out_library.fit(jnp.zeros(self.n_dim_out))
@@ -188,36 +197,67 @@ class BaseSymmLayer:
         # get sympy symbols
         self.symb_lie_in_lib, self.symb_lie_in_jac = symb_jac_from_feat(
                                                     feature_names=self.lie_in_feature_names, 
-                                                    n_state=self.n_dim_in)
+                                                    n_state=self.n_dim_in,
+                                                    return_jac=jac_from_symb)
         # get sympy symbols
         self.symb_lie_out_lib, self.symb_lie_out_jac = symb_jac_from_feat(
                                                     feature_names=self.lie_out_feature_names, 
-                                                    n_state=self.n_dim_out)
+                                                    n_state=self.n_dim_out,
+                                                    return_jac=jac_from_symb)
         
         return self.symb_lie_in_lib, self.symb_lie_in_jac, self.symb_lie_out_lib, self.symb_lie_out_jac
     
-    def _make_jax_fn(self): 
+    def _make_jax_fn(self, jac_from_symb=False): 
         '''
         Convert SymPy symbols for function library 
         to JIT-compiled and vectorized JAX code
         '''
-        self.jax_fn_lib, self.jax_fn_jac = get_jax_from_symb(self.symb_fn_lib, 
-                                                             self.symb_fn_jac, 
-                                                             vectorize=True)
+        
+        # jaxify lib + jacobian from sympy
+        if jac_from_symb:
+            self.jax_fn_lib, self.jax_fn_jac = get_jax_from_symb(self.symb_fn_lib, 
+                                                                self.symb_fn_jac, 
+                                                                vectorize=True)
+        # jaxify lib from sympy + jacobian from autodiff
+        else:
+            self.jax_fn_lib = get_jax_fnlib_from_symb(self.symb_fn_lib,vectorize=False)
+            self.jax_fn_jac = jit(jacfwd(self.jax_fn_lib))
+            
+            # vectorize
+            self.jax_fn_lib = vmap(self.jax_fn_lib, in_axes=(0,))
+            self.jax_fn_jac = vmap(self.jax_fn_jac, in_axes=(0,))
+            
+        
         return self.jax_fn_lib, self.jax_fn_jac
     
-    def _make_jax_lie(self): 
+    def _make_jax_lie(self, from_symb=False): 
         '''
         Convert SymPy symbols for Lie
         to JIT-compiled and vectorized JAX code
         '''
         
-        self.jax_lie_in_lib, self.jax_lie_in_jac = get_jax_from_symb(self.symb_lie_in_lib, 
-                                                                     self.symb_lie_in_jac, 
-                                                                     vectorize=True)
-        self.jax_lie_out_lib, self.jax_lie_out_jac = get_jax_from_symb(self.symb_lie_out_lib, 
-                                                                       self.symb_lie_out_jac, 
-                                                                       vectorize=True)
+        # jaxify lib + jacobian from sympy
+        if from_symb:
+            self.jax_lie_in_lib, self.jax_lie_in_jac = get_jax_from_symb(self.symb_lie_in_lib, 
+                                                                        self.symb_lie_in_jac, 
+                                                                        vectorize=True)
+            self.jax_lie_out_lib, self.jax_lie_out_jac = get_jax_from_symb(self.symb_lie_out_lib, 
+                                                                        self.symb_lie_out_jac, 
+                                                                        vectorize=True)
+        # jaxify lib from sympy + jacobian from autodiff
+        else:
+            self.jax_lie_in_lib = get_jax_fnlib_from_symb(self.symb_lie_in_lib, vectorize=False)
+            self.jax_lie_out_lib = get_jax_fnlib_from_symb(self.symb_lie_out_lib, vectorize=False)
+            
+            self.jax_lie_in_jac = jit(jacfwd(self.jax_lie_in_lib))
+            self.jax_lie_out_jac = jit(jacfwd(self.jax_lie_out_lib))
+            
+            self.jax_lie_in_lib = vmap(self.jax_lie_in_lib, in_axes=(0,))
+            self.jax_lie_out_lib = vmap(self.jax_lie_out_lib, in_axes=(0,))
+            
+            self.jax_lie_in_jac = vmap(self.jax_lie_in_jac, in_axes=(0,))
+            self.jax_lie_out_jac = vmap(self.jax_lie_out_jac, in_axes=(0,))
+            
     
     def _initialize_data(self, sample_points_in, sample_points_out=None):
         '''Initialize data to be used for building the discrete linear operator'''
@@ -236,8 +276,9 @@ class BaseSymmLayer:
         # i.e. W_fn @ fn_lib(x). Not just fn_lib(x). 
         # Fine for right now because it's not used, but generally we 
         # need to push these samples forward if we're going to consider
-        # compositions of symmetry layers. 
-        sample_points_out = self.fn_lib_sample
+        # compositions of symmetry layers.
+        if sample_points_out is None:
+            sample_points_out = self.fn_lib_sample
         self.lie_out_lib_sample = self.jax_lie_out_lib(sample_points_out)
         self.lie_out_jac_sample = self.jax_lie_out_jac(sample_points_out)
         
