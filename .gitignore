@@ -3,6 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+notebooks/
+output/
+*.npy
+*.png
+*.key
+
 # C extensions
 *.so
 
