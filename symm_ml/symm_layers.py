@@ -389,6 +389,10 @@ class BasicSymmBlock:
     The output of the layer is of the form:
         x_out = sigma(y) * z
     Where sigma is a nonlinearity. A la Finzi, this is a gated nonliearity.
+    
+    TO-DO: arranging a partition of parameters into (linear, quad) pairs has apparently been bad
+            for downstream things like vmap and pytrees. It's probably better to treat as a dictionary
+            or something. 
     '''
     def __init__(self, input_rep, output_rep, nonlinearity=jax.nn.elu, include_rep_bias = False, no_quad = False):
         '''
@@ -629,7 +633,7 @@ class BasicSymmBlock:
             lhat_lin = self.lin_layer.L_hat(W_lin).reshape(n_lie_gens,-1)
             lhat_quad = self.quad_layer.L_hat(W_quad).reshape(n_lie_gens,-1)
             l_hats = [lhat_lin, lhat_quad]
-                
+
             big_l_hat = jnp.concatenate(l_hats, axis=-1)
             return big_l_hat
 
@@ -666,6 +670,7 @@ class BlockLayer:
             r_key = block.init_layers(r_key, *bounds)
         
         self.lhat = self._get_lhat()
+        self.transform, self.transform_v = self._get_transform()
         return r_key
     
     def initialize_parameters(self, key, bounds=[-0.01, 0.01]):
@@ -698,21 +703,135 @@ class BlockLayer:
     #         return jnp.concatenate(v_fn(x, layer_params))
     #     return fn
 
+    def _get_transform(self):
+        @jit
+        def transform(x, layer_params):
+            # NOTE: the way this is written, the transform is actually all the same, the need for independent blocks
+            # comes from independent Lhats. Might just conconcatenate a vmap here. 
+            # UPDATE: this requires reformatting the parameters. Might need to do something where we have a dict like:
+            # {'lin':  [block_1_lin, block_2_lin, ...], 
+            #  'quad': [block_1_quad, block_2_quad, ...]}
+            return jnp.concatenate([block.transform(x, block_params) 
+                                    for block_params, block in zip(layer_params, self.blocks)])
+
+
+        @jit
+        def transform_v(x, layer_params):
+            # NOTE: the way this is written, the transform is actually all the same, the need for independent blocks
+            # comes from independent Lhats. Might just conconcatenate a vmap here. 
+            # UPDATE: this requires reformatting the parameters. Might need to do something where we have a dict like:
+            # {'lin':  [block_1_lin, block_2_lin, ...], 
+            #  'quad': [block_1_quad, block_2_quad, ...]}
+            return jnp.concatenate([block.transform_v(x, block_params) 
+                                    for block_params, block in zip(layer_params, self.blocks)], axis=-1)
+        return transform, transform_v
     
-    def transform(self, x, layer_params):
-        # NOTE: the way this is written, the transform is actually all the same, the need for independent blocks
-        # comes from independent Lhats. Might just conconcatenate a vmap here. 
-        # UPDATE: this requires reformatting the parameters. Might need to do something where we have a dict like:
-        # {'lin':  [block_1_lin, block_2_lin, ...], 
-        #  'quad': [block_1_quad, block_2_quad, ...]}
-        return jnp.concatenate([block.transform(x, block_params) for block_params, block in zip(layer_params, self.blocks)])
+    # def transform(self, x, layer_params):
+    #     # NOTE: the way this is written, the transform is actually all the same, the need for independent blocks
+    #     # comes from independent Lhats. Might just conconcatenate a vmap here. 
+    #     # UPDATE: this requires reformatting the parameters. Might need to do something where we have a dict like:
+    #     # {'lin':  [block_1_lin, block_2_lin, ...], 
+    #     #  'quad': [block_1_quad, block_2_quad, ...]}
+    #     return jnp.concatenate([block.transform(x, block_params) 
+    #                             for block_params, block in zip(layer_params, self.blocks)])
 
 
-    def transform_v(self, x, layer_params):
-        # NOTE: the way this is written, the transform is actually all the same, the need for independent blocks
-        # comes from independent Lhats. Might just conconcatenate a vmap here. 
-        # UPDATE: this requires reformatting the parameters. Might need to do something where we have a dict like:
-        # {'lin':  [block_1_lin, block_2_lin, ...], 
-        #  'quad': [block_1_quad, block_2_quad, ...]}
-        return jnp.concatenate([block.transform_v(x, block_params) for block_params, block in zip(layer_params, self.blocks)], axis=-1)
+    # def transform_v(self, x, layer_params):
+    #     # NOTE: the way this is written, the transform is actually all the same, the need for independent blocks
+    #     # comes from independent Lhats. Might just conconcatenate a vmap here. 
+    #     # UPDATE: this requires reformatting the parameters. Might need to do something where we have a dict like:
+    #     # {'lin':  [block_1_lin, block_2_lin, ...], 
+    #     #  'quad': [block_1_quad, block_2_quad, ...]}
+    #     return jnp.concatenate([block.transform_v(x, block_params) 
+    #                             for block_params, block in zip(layer_params, self.blocks)], axis=-1)
 
+
+
+class CopyBlockLayer:
+    '''
+    A multi-block layer that only instantiates a single block
+    '''
+    def __init__(self, 
+                 num_blocks, 
+                 input_rep, output_rep, 
+                 nonlinearity=jax.nn.elu, 
+                 include_rep_bias = True,
+                 out_layer = False):
+        self.out_layer = out_layer
+        self.num_blocks = num_blocks
+        self.input_rep = input_rep
+        self.output_rep = output_rep
+        self.nonlinearity = nonlinearity
+        
+        self.block = BasicSymmBlock(input_rep=self.input_rep, 
+                                      output_rep=self.output_rep, 
+                                      nonlinearity=self.nonlinearity, 
+                                      include_rep_bias = include_rep_bias,
+                                      no_quad=out_layer)
+        
+        self.input_size = self.block.input_size # sum([block.input_size for block in self.blocks])
+        # self.output_size = sum([block.output_size for block in self.blocks])
+        self.output_size = self.block.output_size *  self.num_blocks
+        # self.transform = self._get_fn()
+        
+    def init_layers(self, key, *bounds):
+        r_key = key.copy()
+        
+        # for ii, block in enumerate(self.blocks):
+        r_key = self.block.init_layers(r_key, *bounds)
+        
+        self.lhat = self._get_lhat()
+        self.transform, self.transform_v = self._get_transform()
+        return r_key
+    
+    def initialize_parameters(self, key, bounds=[-0.01, 0.01]):
+        r_key = key.copy()
+        layer_params = []
+        block = self.block
+        for ii in range(self.num_blocks):
+            r_key, block_params = block.initialize_parameters(r_key, bounds)
+            # print(r_key, block)
+            layer_params.append(block_params)
+        return r_key, layer_params
+    
+
+    def _get_lhat(self):
+        block = self.block
+        
+        #NOTE: This is begging for vmap if I just arranged these
+        # layer_params as pytrees. 
+        @jit
+        def lhat(layer_params):
+            l_hats = [] 
+            for block_params in layer_params:
+                lhat = block.lhat(block_params)
+                l_hats.append(lhat)
+            big_l_hat = jnp.concatenate(l_hats, axis=-1)
+            return big_l_hat
+        return lhat
+        
+    def _get_transform(self):
+        block = self.block
+        @jit
+        def transform(x, layer_params):
+            # NOTE: the way this is written, the transform is actually all the same, the need for independent blocks
+            # comes from independent Lhats. Might just conconcatenate a vmap here. 
+            # UPDATE: this requires reformatting the parameters. Might need to do something where we have a dict like:
+            # {'lin':  [block_1_lin, block_2_lin, ...], 
+            #  'quad': [block_1_quad, block_2_quad, ...]}
+            
+            return jnp.concatenate([block.transform(x, block_params) 
+                                    for block_params in layer_params])
+
+        @jit
+        def transform_v(x, layer_params):
+            # NOTE: the way this is written, the transform is actually all the same, the need for independent blocks
+            # comes from independent Lhats. Might just conconcatenate a vmap here. 
+            # UPDATE: this requires reformatting the parameters. Might need to do something where we have a dict like:
+            # {'lin':  [block_1_lin, block_2_lin, ...], 
+            #  'quad': [block_1_quad, block_2_quad, ...]}
+            return jnp.concatenate([block.transform_v(x, block_params) 
+                                    for block_params in layer_params], axis=-1)
+
+
+        return transform, transform_v
