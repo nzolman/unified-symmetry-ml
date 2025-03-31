@@ -80,6 +80,7 @@ class NodeExperimentRunner:
                   'symm': self.symm,
                   'use_mlp': self.use_mlp,
                   'layer_sizes': self.layer_sizes,
+                  'n_params': self.n_params,
                   'symm_reg': self.symm_reg,
                   'lr': self.lr
                   }
