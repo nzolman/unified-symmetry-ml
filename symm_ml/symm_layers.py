@@ -116,6 +116,8 @@ class DummyLayer:
     
     def _L_hat_wrapper(self):
         pass
+    def get_enforced_basis(self, null_thresh=1e-5):
+        return jnp.zeros(0)
 
 class BaseSymmLayer:
     def __init__(self, 
@@ -378,7 +380,17 @@ class BaseSymmLayer:
         
         return W @ self.symb_fn_jac @ gen_in @ self.symb_lie_in_lib - gen_out @ self.symb_lie_out_jac @ W @ self.symb_fn_lib
 
+    def get_enforced_basis(self, null_thresh=1e-5):
+        u,s,vh = jnp.linalg.svd(
+                    jnp.concatenate(
+                        self.symm_op.reshape(-1,self.n_dim_out,self.n_fn_lib).T
+                    )
+                )
+        n_trunc = jnp.sum(s/s[0] < null_thresh)
 
+        coef_basis = u[:,-n_trunc:].reshape(self.n_fn_lib, self.n_dim_out, -1).transpose(2,1,0) 
+        return coef_basis
+    
 
 class BasicSymmBlock:
     ''' 
@@ -394,7 +406,10 @@ class BasicSymmBlock:
             for downstream things like vmap and pytrees. It's probably better to treat as a dictionary
             or something. 
     '''
-    def __init__(self, input_rep, output_rep, nonlinearity=jax.nn.elu, include_rep_bias = False, no_quad = False):
+    def __init__(self, input_rep, output_rep, 
+                 nonlinearity=jax.nn.elu, 
+                 include_rep_bias = False,
+                 no_quad = False):
         '''
         input_rep: ndarray(n_gens, n_in, n_lie_in)
             input representation of the lie generators. For a linear rep,
@@ -479,7 +494,7 @@ class BasicSymmBlock:
         self.transform = self._get_fn()
         self.transform_v = self._get_fn_v()
         
-    def init_layers(self, key, data_min=None, data_max=None):
+    def init_layers(self, key, data_min=None, data_max=None, oversample=1):
         '''
         Initialize the layers with sample points from the domain
         Arguments:
@@ -491,8 +506,8 @@ class BasicSymmBlock:
         r_key = key.copy()
         for i, (layer, name) in enumerate(zip(self.symm_layers, self.layer_names)):
             if not isinstance(layer, DummyLayer):
-                N_sample =  n_poly_points(layer.fn_library.degree, 
-                                        self.n_dim_in) + 1
+                N_sample =  oversample * (n_poly_points(layer.fn_library.degree, 
+                                                        self.n_dim_in) + 1)
             else:
                 N_sample = 1
 
@@ -624,7 +639,6 @@ class BasicSymmBlock:
         return fn
     
     def _get_lhat(self):
-        
         @jit
         def lhat(block_params):
             W_lin, W_quad = block_params
@@ -638,6 +652,135 @@ class BasicSymmBlock:
             return big_l_hat
 
         return lhat
+    
+    def get_enforced_basis(self, trunc_thresh =1e-5):
+        self.lin_proj_basis = self.lin_layer.get_enforced_basis(trunc_thresh)
+        self.quad_proj_basis = self.quad_layer.get_enforced_basis(trunc_thresh)
+        
+        self.n_lin_proj = len(self.lin_proj_basis)
+        self.n_quad_proj = len(self.quad_proj_basis)
+        
+    def initialize_proj_parameters(self, key, bounds=[-0.01,0.01]):
+        r_key  = key.copy()
+        minval, maxval = bounds
+        
+        lin_params = random.uniform(r_key, minval=minval, maxval=maxval, 
+                                shape = (self.n_lin_proj,))
+        r_key, _ = random.split(r_key)
+        
+        quad_params = random.uniform(r_key, minval=minval, maxval=maxval, 
+                                shape = (self.n_quad_proj,))
+        r_key, _ = random.split(r_key)
+        
+        return r_key, [lin_params, quad_params]
+    
+    def change_basis(self, proj_params):
+        proj_lin_params, proj_quad_params = proj_params
+        lifted_lin = jnp.einsum('d,dsf->sf', proj_lin_params, self.lin_proj_basis)
+        if self.no_quad:
+            lifted_quad = proj_quad_params
+        else:
+            lifted_quad = jnp.einsum('d,dsf->sf', proj_quad_params, self.quad_proj_basis)
+        lifted_params =  [lifted_lin, lifted_quad]
+        return lifted_params
+
+# class EnforcedSymmBlock(BasicSymmBlock):
+#     def __init__(self,trunc_thresh =1e-5,  **kwargs):
+#         super().__init__(kwargs)
+#         self.trunc_thresh = trunc_thresh
+#         self.lin_proj_basis = self.lin_layer.get_enforced_basis(trunc_thresh)
+#         self.quad_proj_basis = self.quad_layer.get_enforced_basis(trunc_thresh)
+        
+#         self.n_lin_proj = len(self.lin_proj_basis)
+#         self.n_quad_proj = len(self.quad_proj_basis)
+        
+#         # overwrite these functions
+#         self.transform = self._get_fn_proj()
+#         self.transform_v = self._get_fn_proj_v()
+        
+    # def initialize_proj_parameters(self, key, bounds=[-0.01,0.01]):
+    #     r_key  = key.copy()
+    #     minval, maxval = bounds
+        
+    #     lin_params = random.uniform(r_key, minval=minval, maxval=maxval, 
+    #                             shape = (self.n_lin_proj,))
+    #     r_key, _ = random.split(r_key)
+        
+    #     quad_params = random.uniform(r_key, minval=minval, maxval=maxval, 
+    #                             shape = (self.n_quad_proj,))
+    #     r_key, _ = random.split(r_key)
+        
+    #     return [lin_params, quad_params]
+        
+#     def _get_fn_proj(self):
+#         if self.no_quad:
+#             @jit
+#             def fn(x, proj_block_params):
+#                 proj_W_lin, proj_W_quad = proj_block_params
+#                 W_lin = proj_W_lin @ self.lin_proj_basis
+                
+#                 # W_lin = block_params['lin']
+#                 # W_quad = block_params['quad']
+                
+#                 # first layer
+#                 x0 = x.reshape(1,-1)
+#                 z1 = (W_lin @ self.lin_layer.jax_fn_lib(x0).T).T     # vector
+#                 x1 =  z1
+                
+#                 return x1[0]
+#         else:
+#             @jit
+#             def fn(x, proj_block_params):
+#                 proj_W_lin, proj_W_quad = proj_block_params
+#                 W_lin = proj_W_lin @ self.lin_proj_basis
+#                 W_quad = proj_W_quad @ self.quad_proj_basis
+                
+#                 # W_lin = block_params['lin']
+#                 # W_quad = block_params['quad']
+                
+#                 # first layer
+#                 x0 = x.reshape(1,-1)
+#                 z1 = (W_lin @ self.lin_layer.jax_fn_lib(x0).T).T     # vector
+#                 y1 = (W_quad @ self.quad_layer.jax_fn_lib(x0).T).T   # scalar
+#                 x1 =  z1 * self.nonlinearity(y1)
+                
+#                 return x1[0]
+#         return fn
+            
+#     def _get_fn_proj_v(self):
+#         if self.no_quad:
+#             @jit
+#             def fn(x, proj_block_params):
+#                 proj_W_lin, proj_W_quad = proj_block_params
+#                 W_lin = proj_W_lin @ self.lin_proj_basis
+                
+#                 # W_lin = block_params['lin']
+#                 # W_quad = block_params['quad']
+                
+#                 # first layer
+#                 x0 = x.reshape(1,-1)
+#                 z1 = (W_lin @ self.lin_layer.jax_fn_lib(x0).T).T     # vector
+#                 x1 =  z1
+                
+#                 return x1[0]
+#         else:
+#             @jit
+#             def fn(x, proj_block_params):
+#                 proj_W_lin, proj_W_quad = proj_block_params
+#                 W_lin = proj_W_lin @ self.lin_proj_basis
+#                 W_quad = proj_W_quad @ self.quad_proj_basis
+                
+#                 # W_lin = block_params['lin']
+#                 # W_quad = block_params['quad']
+                
+#                 # first layer
+#                 x0 = x
+#                 z1 = (W_lin @ self.lin_layer.jax_fn_lib(x0).T).T     # vector
+#                 y1 = (W_quad @ self.quad_layer.jax_fn_lib(x0).T).T   # scalar
+#                 x1 =  z1 * self.nonlinearity(y1)
+                
+#                 return x1[0]
+#         return fn
     
 class BlockLayer:
     def __init__(self, 
@@ -663,11 +806,12 @@ class BlockLayer:
         self.output_size = sum([block.output_size for block in self.blocks])
         # self.transform = self._get_fn()
         
-    def init_layers(self, key, *bounds):
+    def init_layers(self, key, *bounds, oversample=1):
+        # TO-DO: allow for oversampling
         r_key = key.copy()
         
         for ii, block in enumerate(self.blocks):
-            r_key = block.init_layers(r_key, *bounds)
+            r_key = block.init_layers(r_key, *bounds, oversample=oversample)
         
         self.lhat = self._get_lhat()
         self.transform, self.transform_v = self._get_transform()
@@ -726,26 +870,24 @@ class BlockLayer:
                                     for block_params, block in zip(layer_params, self.blocks)], axis=-1)
         return transform, transform_v
     
-    # def transform(self, x, layer_params):
-    #     # NOTE: the way this is written, the transform is actually all the same, the need for independent blocks
-    #     # comes from independent Lhats. Might just conconcatenate a vmap here. 
-    #     # UPDATE: this requires reformatting the parameters. Might need to do something where we have a dict like:
-    #     # {'lin':  [block_1_lin, block_2_lin, ...], 
-    #     #  'quad': [block_1_quad, block_2_quad, ...]}
-    #     return jnp.concatenate([block.transform(x, block_params) 
-    #                             for block_params, block in zip(layer_params, self.blocks)])
-
-
-    # def transform_v(self, x, layer_params):
-    #     # NOTE: the way this is written, the transform is actually all the same, the need for independent blocks
-    #     # comes from independent Lhats. Might just conconcatenate a vmap here. 
-    #     # UPDATE: this requires reformatting the parameters. Might need to do something where we have a dict like:
-    #     # {'lin':  [block_1_lin, block_2_lin, ...], 
-    #     #  'quad': [block_1_quad, block_2_quad, ...]}
-    #     return jnp.concatenate([block.transform_v(x, block_params) 
-    #                             for block_params, block in zip(layer_params, self.blocks)], axis=-1)
-
-
+    def get_enforced_basis(self,trunc_thresh =1e-5):
+        for block in self.blocks:
+            block.get_enforced_basis(trunc_thresh)
+    
+    def change_basis(self, proj_params):
+        return [block.change_basis(block_params)
+                for block_params, block in zip(proj_params, self.blocks)
+                ]
+        
+    def initialize_proj_parameters(self, key, bounds=[-0.01, 0.01]):
+        r_key = key.copy()
+        layer_params = []
+        for ii, block in enumerate(self.blocks):
+            r_key, block_params = block.initialize_proj_parameters(r_key, bounds)
+            # print(r_key, block)
+            layer_params.append(block_params)
+        return r_key, layer_params
+    
 
 class CopyBlockLayer:
     '''
@@ -756,12 +898,14 @@ class CopyBlockLayer:
                  input_rep, output_rep, 
                  nonlinearity=jax.nn.elu, 
                  include_rep_bias = True,
-                 out_layer = False):
+                 out_layer = False,
+                 enforce = False):
         self.out_layer = out_layer
         self.num_blocks = num_blocks
         self.input_rep = input_rep
         self.output_rep = output_rep
         self.nonlinearity = nonlinearity
+        self.enforce = enforce
         
         self.block = BasicSymmBlock(input_rep=self.input_rep, 
                                       output_rep=self.output_rep, 
@@ -774,14 +918,20 @@ class CopyBlockLayer:
         self.output_size = self.block.output_size *  self.num_blocks
         # self.transform = self._get_fn()
         
-    def init_layers(self, key, *bounds):
+
+        
+    def init_layers(self, key, *bounds, oversample=1):
+        # TO-DO: allow for oversampling
         r_key = key.copy()
         
         # for ii, block in enumerate(self.blocks):
-        r_key = self.block.init_layers(r_key, *bounds)
+        r_key = self.block.init_layers(r_key, *bounds, oversample=oversample)
         
         self.lhat = self._get_lhat()
         self.transform, self.transform_v = self._get_transform()
+        
+        if self.enforce:
+            self.get_enforced_basis(trunc_thresh=1e-5)
         return r_key
     
     def initialize_parameters(self, key, bounds=[-0.01, 0.01]):
@@ -801,7 +951,12 @@ class CopyBlockLayer:
         #NOTE: This is begging for vmap if I just arranged these
         # layer_params as pytrees. 
         @jit
-        def lhat(layer_params):
+        def lhat(params):
+            if self.enforce:
+                # note, this should stuff everything into the nullspace
+                layer_params = self.change_basis(params)
+            else:
+                layer_params = params 
             l_hats = [] 
             for block_params in layer_params:
                 lhat = block.lhat(block_params)
@@ -813,7 +968,13 @@ class CopyBlockLayer:
     def _get_transform(self):
         block = self.block
         @jit
-        def transform(x, layer_params):
+        def transform(x, params):
+            if self.enforce:
+                layer_params = self.change_basis(params)
+            else:
+                layer_params = params
+                
+
             # NOTE: the way this is written, the transform is actually all the same, the need for independent blocks
             # comes from independent Lhats. Might just conconcatenate a vmap here. 
             # UPDATE: this requires reformatting the parameters. Might need to do something where we have a dict like:
@@ -824,7 +985,11 @@ class CopyBlockLayer:
                                     for block_params in layer_params])
 
         @jit
-        def transform_v(x, layer_params):
+        def transform_v(x, params):
+            if self.enforce:
+                layer_params = self.change_basis(params)
+            else:
+                layer_params = params
             # NOTE: the way this is written, the transform is actually all the same, the need for independent blocks
             # comes from independent Lhats. Might just conconcatenate a vmap here. 
             # UPDATE: this requires reformatting the parameters. Might need to do something where we have a dict like:
@@ -835,3 +1000,23 @@ class CopyBlockLayer:
 
 
         return transform, transform_v
+
+
+    def get_enforced_basis(self,trunc_thresh =1e-5):
+
+        self.block.get_enforced_basis(trunc_thresh)
+    
+    def change_basis(self, proj_params):
+        return [self.block.change_basis(block_params)
+                for block_params in proj_params
+                ]
+
+    def initialize_proj_parameters(self, key, bounds=[-0.01, 0.01]):
+        r_key = key.copy()
+        layer_params = []
+        block = self.block
+        for ii in range(self.num_blocks):
+            r_key, block_params = block.initialize_proj_parameters(r_key, bounds)
+            # print(r_key, block)
+            layer_params.append(block_params)
+        return r_key, layer_params  
