@@ -3,28 +3,37 @@ from tqdm import tqdm
 import optax
 from jax import random, tree, value_and_grad, jit
 from jax import numpy as jnp
-from symm_ml.dynamics.node import MLPNODE
+from symm_ml.dynamics.node import MLPNODE,SymmMLPNODE
 from symm_ml.dynamics.symm_node import SymmNet, get_tot_params
 
 from symm_ml import _parent_dir
-_pend_data_dir  = os.path.join(_parent_dir, 'datasets/ODEDynamics/double_spring_pendulum/')
+_pend_data_dir  = os.path.join(_parent_dir, 
+                               'datasets/ODEDynamics/double_spring_pendulum/'
+                               )
 
-def get_pend_data(use_normal = True):
+def get_pend_data(seed=0, use_normal = True):
     if use_normal:
         path = os.path.join(_pend_data_dir, 'trajectories_1500_5_0.2_30.pz.npy')
     else:
         path = os.path.join(_pend_data_dir, 'trajectories_1500_5_0.2_30_no-y=True.pz.npy')
     data = jnp.load(path)
 
-    train = data[:500]
-    val = data[500:1000]
-    test = data[1000:]
+    key = random.PRNGKey(seed)
+    permuted_data = random.permutation(key, data)
+    
+    train = permuted_data[:500]
+    val = permuted_data[500:1000]
+    test = permuted_data[1000:]
     
     return train, val, test    
 
 class NodeExperimentRunner:
-    def __init__(self, seed=0, symm=None, use_mlp=False, 
-                 layer_sizes=None, nonlinearity = jnp.tanh,symm_kwargs=None,
+    def __init__(self, seed=0, 
+                 symm=None, 
+                 use_mlp=False, 
+                 layer_sizes=None, 
+                 nonlinearity = jnp.tanh,
+                 symm_kwargs=None,
                  lr = 3e-4,
                  symm_reg = 0):
         
@@ -35,6 +44,7 @@ class NodeExperimentRunner:
         self.layer_sizes = layer_sizes
         self.nonlinearity=nonlinearity
         self.symm_kwargs = symm_kwargs or {}
+        self.enforce = self.symm_kwargs.get('enforce', False)
         self.symm_reg = symm_reg
         self.lr = lr
         self.n_state = 12 # hard coded because SymmNet currently hard coded. 
@@ -46,17 +56,31 @@ class NodeExperimentRunner:
         self.optimizer, self.opt_state, self.train_step_fn = self.setup_train_step()
         
     def setup_net(self):
-        if self.use_mlp and not self.symm:
-            self.node = MLPNODE(self.nonlinearity)
-            self.params_0 = self.node.init_params(self.layer_sizes, self.key)
+        
+        # MLP architecture
+        if self.use_mlp:
+            # vanilla MLP NODE
+            if not self.symm:
+                self.node = MLPNODE(self.nonlinearity)  
+            # symm regularization node
+            
+            else:
+                self.node = SymmMLPNODE(self.nonlinearity, 
+                                    rep_type = self.symm,
+                                    **self.symm_kwargs)
+                self.node._setup_symm(self.key)
+
             self.key, _ = random.split(self.key)
             
+            self.params_0 = self.node.init_params(
+                                    self.layer_sizes, 
+                                    self.key)
             self.n_params = sum([p.size for p in tree.leaves(self.params_0)])
-            # self.loss_fn = 
-            
+        
+        # composed polynomials with gated nonlinearities
         else:
             if not self.symm:
-                symm_rep = 'so2'
+                symm_rep = 'so2' # small dummy representative
             else: 
                 symm_rep = self.symm
             self.node = SymmNet(n_blocks_per_layer=self.layer_sizes,
@@ -69,7 +93,8 @@ class NodeExperimentRunner:
             self.n_params = get_tot_params(self.layer_sizes, self.n_state)
             self.node._setup_fns()
         
-        if self.symm:
+
+        if self.symm and (not self.enforce):
             self.loss_fn = self.node.total_loss
         else:
             self.loss_fn = self.node.data_loss
@@ -82,7 +107,8 @@ class NodeExperimentRunner:
                   'layer_sizes': self.layer_sizes,
                   'n_params': self.n_params,
                   'symm_reg': self.symm_reg,
-                  'lr': self.lr
+                  'lr': self.lr,
+                  'symm_kwargs': self.symm_kwargs
                   }
         return config
 
@@ -93,7 +119,8 @@ class NodeExperimentRunner:
 
         v_g = value_and_grad(self.loss_fn)
         
-        if self.symm:
+        # symm_loss + data_loss
+        if self.symm and (not self.enforce):
             @jit
             def train_step_fn(params, opt_state, batch, labels):
                 loss_value, grads = v_g(params, batch, labels, self.symm_reg)
@@ -101,6 +128,7 @@ class NodeExperimentRunner:
                 new_params = optax.apply_updates(params, updates)
                 return new_params, opt_state, loss_value
         else:
+            # only data loss
             @jit
             def train_step_fn(params, opt_state, batch, labels):
                 loss_value, grads = v_g(params, batch, labels)
@@ -125,4 +153,7 @@ class NodeExperimentRunner:
             if i % save_freq == 0: 
                 params_list.append(new_params)
                 losses.append(loss_value)
+                if jnp.isnan(loss_value):
+                    print('NaN found, stopping')
+                    break
         return params_list, losses

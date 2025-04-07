@@ -30,7 +30,9 @@ class SymmNet:
                  bounds_max=2, 
                  param_bounds = [-0.1,0.1], 
                  nonlinearity=jax.nn.tanh,
-                 use_copy=True):
+                 use_copy=True,
+                 enforce = False,
+                 oversample=1):
         
         self.bounds_max = bounds_max
         self.param_bounds = param_bounds
@@ -39,6 +41,7 @@ class SymmNet:
         self.rep_type = rep_type
         self.nonlinearity = nonlinearity
         self.use_copy = use_copy
+        self.oversample = oversample
         
         self.dt = 0.2
         self.T_max = 1.0
@@ -53,14 +56,20 @@ class SymmNet:
         elif rep_type == 'so2':
             self.lie_gen_fn = so2_xy_system_copy
             self.include_rep_bias = False
-        
+            
+        self.enforce = enforce
+    
     def init_params(self, key):
         all_params = []
         r_key = key.copy()
         for i in range(self.n_layers+1):
             layer = self.layers[i]
-            r_key, layer_params = layer.initialize_parameters(r_key, 
-                                                              bounds=self.param_bounds)
+            if self.enforce:
+                r_key, layer_params = layer.initialize_proj_parameters(r_key, 
+                                                                        bounds=self.param_bounds)
+            else:
+                r_key, layer_params = layer.initialize_parameters(r_key, 
+                                                                bounds=self.param_bounds)
             all_params.append(layer_params)
         return r_key, all_params
         
@@ -97,9 +106,12 @@ class SymmNet:
                                 output_rep=rep_out,  
                                 nonlinearity=self.nonlinearity, 
                                 include_rep_bias = self.include_rep_bias,
-                                out_layer = out_layer)
+                                out_layer = out_layer,
+                                enforce = self.enforce)
             
-            r_key = layer.init_layers(r_key, *sample_bounds)
+            
+            # TO-DO: allow for oversampling
+            r_key = layer.init_layers(r_key, *sample_bounds, oversample=self.oversample)
             
             layers.append(layer)
             
@@ -135,7 +147,7 @@ class SymmNet:
 
         @jit
         def node_vf(x0, t, params):
-            return node(params,x0)
+            return node(params, x0)
 
 
         @jit
