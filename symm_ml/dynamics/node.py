@@ -5,6 +5,8 @@ import jax.numpy as jnp
 from symm_ml.dynamics.nn_utils import random_layer_params, init_network_params, get_mlp
 from symm_ml.dynamics.lie_utils import so3_system_copy, se3_system_copy, so2_xy_system_copy
 
+ODE_TOL = {} # dict(atol=2e-6, rtol=2e-6) Finzi tol relaxation
+
 class MLPNODE:
     def __init__(self, nonlinearity):
         self.nonlinearity = nonlinearity
@@ -29,11 +31,13 @@ class MLPNODE:
 
         @jit
         def node_predict(params, x0):
-            return odeint(node_vf, x0, jnp.arange(0,self.T_max,self.dt), params)
+            return odeint(node_vf, x0, jnp.arange(0,self.T_max,self.dt), params, 
+                          **ODE_TOL)
 
         @jit
         def node_predict_batched(params, X0):
-            return odeint(node_vf_batched, X0, jnp.arange(0,self.T_max,self.dt), params).transpose(1,0,2)
+            return odeint(node_vf_batched, X0, jnp.arange(0,self.T_max,self.dt), params,
+                          **ODE_TOL).transpose(1,0,2)
 
         @jit
         def data_loss(params, X0, X): 

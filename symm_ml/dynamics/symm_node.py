@@ -11,6 +11,8 @@ from symm_ml.symm_layers import BaseSymmLayer, BasicSymmBlock, BlockLayer, CopyB
 
 from symm_ml.dynamics.lie_utils import so3_system_copy, se3_system_copy, so2_xy_system_copy
 
+# ODE_TOL = dict(atol=2e-6, rtol=2e-6)
+ODE_TOL = {}
 
 def get_tot_params(n_blocks_per_layer, n_state):
     m = n_state
@@ -153,7 +155,8 @@ class SymmNet:
         @jit
         def node_predict_batched(params, x0):
             # return odeint(node_vf, x0, jnp.arange(0,T_max,dt), params) # .transpose(1,0,2)
-            return odeint(node_vf, x0, jnp.arange(0,self.T_max,self.dt), params).transpose(1,0,2)
+            return odeint(node_vf, x0, jnp.arange(0,self.T_max,self.dt), params,
+                          **ODE_TOL).transpose(1,0,2)
 
         @jit
         def data_loss(params, X0, X):
