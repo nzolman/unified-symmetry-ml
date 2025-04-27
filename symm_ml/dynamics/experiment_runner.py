@@ -16,7 +16,9 @@ def get_pend_data(seed=0, use_normal = True):
         path = os.path.join(_pend_data_dir, 'trajectories_1500_5_0.2_30.pz.npy')
     else:
         path = os.path.join(_pend_data_dir, 'trajectories_1500_5_0.2_30_no-y=True.pz.npy')
+    
     data = jnp.load(path)
+
 
     key = random.PRNGKey(seed)
     permuted_data = random.permutation(key, data)
@@ -25,7 +27,20 @@ def get_pend_data(seed=0, use_normal = True):
     val = permuted_data[500:1000]
     test = permuted_data[1000:]
     
-    return train, val, test    
+    path_30 = os.path.join(_pend_data_dir, 'trajectories_1_150_0.2_30_no-y=False.pz.npy')
+    data_30 = jnp.load(path_30)
+    
+    return train, val, test, data_30
+
+def rel_errs(preds, trues):
+    diff_norms = jnp.linalg.norm(preds - trues, axis=-1)
+    pred_norms = jnp.linalg.norm(preds, axis=-1)
+    true_norms = jnp.linalg.norm(trues, axis=-1)
+    return diff_norms/(pred_norms + true_norms)
+
+
+def geo_mean_rel(x):
+    return jnp.exp(jnp.mean(jnp.log(x)))
 
 class NodeExperimentRunner:
     def __init__(self, seed=0, 
